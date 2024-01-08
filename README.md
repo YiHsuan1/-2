@@ -1,11 +1,17 @@
 # # AI-利用神經網絡製作一个識別手寫數字的程序
 南華大學跨領域-人工智能期中報告 11123024楊佳宜 11123007 陳奕瑄 11118128 吳佳恩
+原文链接：https://blog.csdn.net/lxiao428/article/details/133877333
 
 目錄
+
 1.紅綠燈偵測資料集
+
 2、使用KerasCV YOLOv8 進行物體偵測
+
 3.驗證影像的推理
+
 4、使用經過訓練的KerasCV YOLOv8 模型進行視訊推理
+
 5.總結與結論
 
 交通燈偵測資料集
@@ -288,3 +294,154 @@ val_ds = val_ds.map(dict_to_tuple, num_parallel_calls=tf.data.AUTOTUNE)
 val_ds = val_ds.prefetch(tf.data.AUTOTUNE)
 ```
 為方便模型訓練，使用dict_too_tuple 函數對資料集進行轉換，並透過預取功能對資料集進行最佳化，以獲得更好的效能。
+KerasCV YOLOv8模型
+
+使用COCO 預訓練主幹創建KerasCV YOLOv8 模型，主幹是YOLOv8 Large，整個預訓練模型中，先用COCO 預訓練權重加載主幹網，然後使用隨機初始化的頭部權重創建整個YOLOv8 模型。
+```python
+backbone = keras_cv.models.YOLOV8Backbone.from_preset(
+    "yolo_v8_l_backbone_coco",
+    load_weights=True
+)
+ 
+yolo = keras_cv.models.YOLOV8Detector(
+    num_classes=len(class_mapping),
+    bounding_box_format="xyxy",
+    backbone=backbone,
+    fpn_depth=3,
+)
+ 
+yolo.summary()
+```
+設定load_weights = True 很重要，否則COCO 預訓練的權重將無法載入到主幹網路。
+
+由於資料集註解檔案是XML 格式，所有的邊界框都是XYXY 格式，因此上述程式碼區塊中的bounding_box_format 為「xyxy」。此外，根據KerasCV YOLOv8 官方文檔，fpn_depth 為3。
+
+下一步：定義最佳化器並編譯模型
+optimizer = tf.keras.optimizers.Adam(
+learning_rate=LEARNING_RATE,
+global_clipnorm=GLOBAL_CLIPNORM,
+)
+
+yolo.compile(
+optimizer=optimizer, classification_loss=“binary_crossentropy”, box_loss=“ciou”
+)
+
+學習率按照先前的定義進行設置，梯度剪切則使用global_clipnorm 參數，這確保了影響模型參數更新的梯度不會變得太大而破壞訓練的穩定性。
+
+優化器準備好後，繼續編譯YOLOv8 模型，這樣模型就可以使用下面定義的損失函數進行訓練了：
+
+· Classification_loss：選擇「binary_crossentropy」作為分類損失；
+
+· box_loss:「ciou」或「Complete Intersection over Union」是一種先進的邊界框損失函數，它可以解釋預測框和真實框之間的大小和形狀差異。
+
+最終建立的模型包含4,100 萬個參數，以下是模型摘要的片段，以及可訓練參數的數量。
+
+評估指標
+
+我們選擇平均值(mAP) 作為評估指標，KerasCV 已經為他所有目標偵測模型提供了mAP 的最佳化實作。
+
+```python
+class EvaluateCOCOMetricsCallback(keras.callbacks.Callback):
+    def __init__(self, data, save_path):
+        super().__init__()
+        self.data = data
+        self.metrics = keras_cv.metrics.BoxCOCOMetrics(
+            bounding_box_format="xyxy",
+            evaluate_freq=1e9,
+        )
+ 
+        self.save_path = save_path
+        self.best_map = -1.0
+ 
+    def on_epoch_end(self, epoch, logs):
+        self.metrics.reset_state()
+        for batch in self.data:
+            images, y_true = batch[0], batch[1]
+            y_pred = self.model.predict(images, verbose=0)
+            self.metrics.update_state(y_true, y_pred)
+ 
+        metrics = self.metrics.result(force=True)
+        logs.update(metrics)
+ 
+        current_map = metrics["MaP"]
+        if current_map > self.best_map:
+            self.best_map = current_map
+            self.model.save(self.save_path)  # Save the model when mAP improves
+ 
+        return logs
+```
+使用自訂Keras 回呼來定義EvaluateCOCOMetricsCallback，在每次驗證循環後執行，如果目前的mAP 大於先前的最佳mAP，那麼模型權重將會儲存到磁碟中。
+
+
+Tensorboard回呼日誌
+
+我們也要定義一個Tensorboard 回調，用於自動記錄所有mAP 和損失圖。
+```python
+tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir="logs_yolov8large")
+```
+所有Tensorboard 日誌都將儲存在logs_yolov8large 目錄中。
+對KerasCV YOLO8模型進行紅綠燈偵測的訓練
+現在可以開始訓練過程了，所有元件都已準備就緒，只需呼叫yolo.fit() 方法就可以開始訓練。
+```python
+history = yolo.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCH,
+    callbacks=[
+        EvaluateCOCOMetricsCallback(val_ds, "model_yolov8large.h5"),
+        tensorboard_callback
+    ],
+)
+```
+train_ds 和val_ds 分別用作訓練資料集和驗證資料集，而且我們還提供了上一節中定義的回調，mAP 和loss 的值將儲存在歷史變數中。由於所有資料都會記錄到Tensorboard 中，所以並不需要這些資料。
+
+YOLOv8 模型的最佳mAP 超過48%，這也是保存最佳模型權重的地方。
+
+驗證影像的推理
+
+由於我們現在已經有了訓練好的模型，因此可以用它來對驗證集的圖像進行推理。
+```python
+def visualize_detections(model, dataset, bounding_box_format):
+    for i in range(10):
+        images, y_true = next(iter(dataset.take(i+1)))
+        y_pred = model.predict(images)
+        y_pred = bounding_box.to_ragged(y_pred)
+        visualization.plot_bounding_box_gallery(
+            images,
+            value_range=(0, 255),
+            bounding_box_format=bounding_box_format,
+            # y_true=y_true,
+            y_pred=y_pred,
+            scale=4,
+            rows=2,
+            cols=2,
+            show=True,
+            font_scale=0.7,
+            class_mapping=class_mapping,
+        )
+visualize_detections(yolo, dataset=val_ds, bounding_box_format="xyxy")
+```
+上述函數對資料循環10 次進行推理，每次推理後，都會使用KerasCV 內建的plot_bounding_box_gallery 函數繪製結果。
+
+下圖顯示了一些預測正確的結果
+模型對所有紅綠燈的預測都是正確的。
+
+儘管模型準確度非常高了，但還不夠完美，以下是一些預測結果不正確的圖片。
+上圖顯示了一個圖像實例，模型將建築物的窗戶預測為紅綠燈，在另一個例子中，它缺少綠色和紅色紅綠燈的預測。
+
+為了緩解上述情況，除了水平翻轉之外，還可以對影像進行更多增強。KerasCV 有許多增強功能，可用於減少過度擬合並提高不同情況下的準確性。
+
+使用模型進行視訊推理
+
+使用經過訓練的KerasCV YOLOv8 模型進行視頻推理，在可下載內容中找到視頻推理腳本，並在自己的視頻上運行推理，下面是運行視頻推理的示例命令。
+```python
+python infer_video.py --input inference_data/video.mov
+```
+輸入（–input）標記會取得運行推理的視訊檔案的路徑，下面是視訊推理實驗的輸出範例。
+
+結果看起來不錯，幾乎在所有幀中，模型都能正確檢測到紅綠燈，當然也有一點閃爍，但很有可能在經過更多的訓練和增強後就會消失。
+使用訓練有素的KerasCV YOLOv8 模型進行紅綠燈
+
+總結與結論
+
+本文到此結束，從KerasCV 的初始設定開始，然後進入紅綠燈偵測資料集，詳細介紹了YOLOv8 偵測模型的準備工作，隨後進行了訓練和驗證。
