@@ -80,7 +80,7 @@ download_file(
     'https://www.dropbox.com/scl/fi/suext2oyjxa0v4p78bj3o/S2TLD_720x1280.zip?rlkey=iequuynn54uib0uhsc7eqfci4&dl=1',
     'S2TLD_720x1280.zip'
 )
-获取数据集请联系peaeci122
+#获取数据集请联系peaeci122
 ```
 解壓縮資料集
 ```python
@@ -183,3 +183,108 @@ for xml_file in tqdm(xml_files):
     bbox.append(boxes)
     classes.append(class_ids)
 ```
+parse_annotation(xml_file) 函數會深入研究每個XML 文件，提取文件名稱、物件類別及其各自的邊界框座標。在class_mapping 的幫助下，它會將​​類別名稱轉換為類別ID，以便於使用。
+解析完所有XML檔案後，我們在單獨的清單中收集所有影像路徑、邊界框和類別id，然後使用tf.data.Dataset.from_tensor_slices 將它們組合成TensorFlow資料集。
+```python
+bbox = tf.ragged.constant(bbox)
+classes = tf.ragged.constant(classes)
+image_paths = tf.ragged.constant(image_paths)
+ 
+data = tf.data.Dataset.from_tensor_slices((image_paths, classes, bbox))
+```
+所有資料並未儲存在單一tf.data.Dataset物件中，需要使用SPLIT_RATIO 將其分為訓練集和驗證集。
+```python
+# Determine the number of validation samples
+num_val = int(len(xml_files) * SPLIT_RATIO)
+ 
+# Split the dataset into train and validation sets
+val_data = data.take(num_val)
+train_data = data.skip(num_val)
+```
+載入圖像和註釋，並套用所需的預處理。
+```python
+def load_image(image_path):
+    image = tf.io.read_file(image_path)
+    image = tf.image.decode_jpeg(image, channels=3)
+    return image
+ 
+def load_dataset(image_path, classes, bbox):
+    # Read Image
+    image = load_image(image_path)
+    bounding_boxes = {
+        "classes": tf.cast(classes, dtype=tf.float32),
+        "boxes": bbox,
+    }
+    return {"images": tf.cast(image, tf.float32), "bounding_boxes": bounding_boxes}
+ 
+augmenter = keras.Sequential(
+    layers=[
+        keras_cv.layers.RandomFlip(mode="horizontal", bounding_box_format="xyxy"),
+        keras_cv.layers.JitteredResize(
+            target_size=(640, 640),
+            scale_factor=(1.0, 1.0),
+            bounding_box_format="xyxy",
+        ),
+    ]
+)
+ 
+train_ds = train_data.map(load_dataset, num_parallel_calls=tf.data.AUTOTUNE)
+train_ds = train_ds.shuffle(BATCH_SIZE * 4)
+train_ds = train_ds.ragged_batch(BATCH_SIZE, drop_remainder=True)
+train_ds = train_ds.map(augmenter, num_parallel_calls=tf.data.AUTOTUNE)
+```
+對於訓練集，將影像調整為640×640 分辨率，並應用隨機水平翻轉增強，增強將確保模型不會過早過度擬合。
+至於驗證集，則不需要任何增強，只需調整影像大小就足夠了。
+```python
+resizing = keras_cv.layers.JitteredResize(
+    target_size=(640, 640),
+    scale_factor=(1.0, 1.0),
+    bounding_box_format="xyxy",
+)
+ 
+val_ds = val_data.map(load_dataset, num_parallel_calls=tf.data.AUTOTUNE)
+val_ds = val_ds.shuffle(BATCH_SIZE * 4)
+val_ds = val_ds.ragged_batch(BATCH_SIZE, drop_remainder=True)
+val_ds = val_ds.map(resizing, num_parallel_calls=tf.data.AUTOTUNE)
+```
+在進入下一階段之前，使用上面創建的訓練和驗證資料集來視覺化一些樣本。
+```python
+def visualize_dataset(inputs, value_range, rows, cols, bounding_box_format):
+    inputs = next(iter(inputs.take(1)))
+    images, bounding_boxes = inputs["images"], inputs["bounding_boxes"]
+    visualization.plot_bounding_box_gallery(
+        images,
+        value_range=value_range,
+        rows=rows,
+        cols=cols,
+        y_true=bounding_boxes,
+        scale=5,
+        font_scale=0.7,
+        bounding_box_format=bounding_box_format,
+        class_mapping=class_mapping,
+    )
+ 
+ 
+visualize_dataset(
+    train_ds, bounding_box_format="xyxy", value_range=(0, 255), rows=2, cols=2
+)
+ 
+visualize_dataset(
+    val_ds, bounding_box_format="xyxy", value_range=(0, 255), rows=2, cols=2
+)
+```
+以下是上述視覺化功能的一些輸出結果
+
+最後，建立最終的資料集格式
+```python
+def dict_to_tuple(inputs):
+    return inputs["images"], inputs["bounding_boxes"]
+ 
+ 
+train_ds = train_ds.map(dict_to_tuple, num_parallel_calls=tf.data.AUTOTUNE)
+train_ds = train_ds.prefetch(tf.data.AUTOTUNE)
+ 
+val_ds = val_ds.map(dict_to_tuple, num_parallel_calls=tf.data.AUTOTUNE)
+val_ds = val_ds.prefetch(tf.data.AUTOTUNE)
+```
+為方便模型訓練，使用dict_too_tuple 函數對資料集進行轉換，並透過預取功能對資料集進行最佳化，以獲得更好的效能。
